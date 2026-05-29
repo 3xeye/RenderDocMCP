@@ -171,6 +171,7 @@ class RequestHandler:
             show_all=params.get("show_all", False),
             enable_name_heuristic=params.get("enable_name_heuristic", True),
             enable_mesh_detection=params.get("enable_mesh_detection", True),
+            enable_live_set=params.get("enable_live_set", True),
             collect_draw_names=params.get("collect_draw_names", True),
             max_draw_names_per_buffer=params.get("max_draw_names_per_buffer", 8),
             large_resource_threshold_mb=params.get("large_resource_threshold_mb", 128),

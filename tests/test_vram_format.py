@@ -209,13 +209,43 @@ def run():
     failures += not _check("cbuffer -> None (no RT)", est._usage_texture_category("buf_cb"), None)
 
     # VB/IB 役割の導出
-    geom, gstats = est._derive_geometry_usage()
+    geom, gstats = est._derive_geometry_usage({})
     failures += not _check("geometry buffers detected", gstats["buffers_detected"], 3)
     failures += not _check("buf_vb roles", vram.geometry_category_from_roles(geom["buf_vb"]["roles"]), "Mesh/VertexBuffer")
     failures += not _check("buf_ib roles", vram.geometry_category_from_roles(geom["buf_ib"]["roles"]), "Mesh/IndexBuffer")
     failures += not _check("buf_mesh roles", vram.geometry_category_from_roles(geom["buf_mesh"]["roles"]), "Mesh/Vertex+Index")
     failures += not _check("buf_vb event count", len(geom["buf_vb"]["events"]), 2)
     failures += not _check("cbuffer not geometry", "buf_cb" in geom, False)
+
+    # --- live-set 峰値 (スイープライン) と未引用資源 ---
+    # A[1..3]=100, B[2..4]=200 (A と event2,3 で重複), C[10..11]=50 (分離),
+    # D=999 は usage なし(未引用)。全量和=1349、峰値=event2 の A+B=300。
+    ls_est = vram._VramEstimator(ctx=None, controller=None, enable_mesh_detection=True, enable_live_set=True)
+    ls_est._usage_by_rid = {
+        "A": {"roles": set(), "events": {1, 2, 3}},
+        "B": {"roles": set(), "events": {2, 3, 4}},
+        "C": {"roles": set(), "events": {10, 11}},
+    }
+    ls_rows = [
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "A", "bytes": 100},
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "B", "bytes": 200},
+        {"kind": "Buffer", "category": "Mesh/VertexBuffer", "resource_id": "C", "bytes": 50},
+        {"kind": "Texture", "category": "Texture/Regular", "resource_id": "D", "bytes": 999},
+    ]
+    live = ls_est._compute_live_set(ls_rows, {2: "GBufferPass"})
+    failures += not _check("live-set peak bytes", live["peak_bytes"], 300)
+    failures += not _check("live-set peak event", live["peak_event_id"], 2)
+    failures += not _check("live-set peak name", live["peak_event_name"], "GBufferPass")
+    failures += not _check("live-set peak live count", live["peak_live_resources"], 2)
+    failures += not _check("live-set considered (excl. unref)", live["resources_considered"], 3)
+    # 全量和(1349)より峰値(300)が小さいこと = aliasing を重複計上しない効果
+    failures += not _check("live-set peak < grand total", live["peak_bytes"] < 1349, True)
+    failures += not _check("live-set peak category", live["peak_categories"][0]["category"], "RT/Color")
+
+    unref = ls_est._collect_unreferenced(ls_rows)
+    failures += not _check("unreferenced count", unref["count"], 1)
+    failures += not _check("unreferenced bytes", unref["total_bytes"], 999)
+    failures += not _check("unreferenced top rid", unref["top_resources"][0]["resource_id"], "D")
 
     print("\n%d failure(s)" % failures)
     return failures

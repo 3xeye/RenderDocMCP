@@ -116,10 +116,15 @@ get_pipeline_state(event_id=123)
 ### VRAM推定
 
 ```
-estimate_vram(top_n=100, enable_mesh_detection=true)
+estimate_vram(top_n=100, enable_mesh_detection=true, enable_live_set=true)
 ```
 
-`estimate_vram` は RenderDoc capture 内の API 可視 Texture / Buffer を列挙し、Texture/RT/Depth/Swapchain、Buffer、Mesh Vertex/Index/Instance Buffer のカテゴリ別集計を返す。これはドライバの正確なVRAM使用量ではなく、RenderDocから見えるリソース記述に基づく推定値。
+`estimate_vram` は RenderDoc capture 内の API 可視 Texture / Buffer を列挙し、Texture/RT/Depth/Swapchain、Buffer、Mesh Vertex/Index Buffer のカテゴリ別集計を返す。これはドライバの正確なVRAM使用量ではなく、RenderDocから見えるリソース記述に基づく推定値。
+
+RT分類とMesh Buffer検出は RenderDoc のリソース使用状況 (`GetUsage`) を正典として導出する（drawcall を逐次リプレイしないため高速）。`enable_live_set=true`（既定）では追加で以下を返す:
+
+- `live_set`: 使用ライフタイムに基づく**同時存在リソースのピーク (peak working set)** 推定。ライフタイムが重ならない一時/プールRTを重複計上しないため、全量和 (`totals.grand_bytes`) より実VRAM圧に近い。`peak_event_id` / `peak_categories` でピーク発生箇所と内訳を確認できる。
+- `unreferenced`: フレーム内で一度も参照されない（`GetUsage` が空の）リソース一覧。浪費候補の特定に使えるが、staging/upload や使用前のバックバッファ等の正当なアイドル資源も含みうる。
 
 ### テクスチャデータの取得
 

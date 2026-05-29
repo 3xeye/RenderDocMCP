@@ -22,6 +22,7 @@ class VramService:
         show_all=False,
         enable_name_heuristic=True,
         enable_mesh_detection=True,
+        enable_live_set=True,
         collect_draw_names=True,
         max_draw_names_per_buffer=8,
         large_resource_threshold_mb=128,
@@ -41,6 +42,7 @@ class VramService:
                     show_all=show_all,
                     enable_name_heuristic=enable_name_heuristic,
                     enable_mesh_detection=enable_mesh_detection,
+                    enable_live_set=enable_live_set,
                     collect_draw_names=collect_draw_names,
                     max_draw_names_per_buffer=max_draw_names_per_buffer,
                     large_resource_threshold_mb=large_resource_threshold_mb,
@@ -67,6 +69,7 @@ class _VramEstimator:
         show_all=False,
         enable_name_heuristic=True,
         enable_mesh_detection=True,
+        enable_live_set=True,
         collect_draw_names=True,
         max_draw_names_per_buffer=8,
         large_resource_threshold_mb=128,
@@ -77,6 +80,7 @@ class _VramEstimator:
         self.show_all = bool(show_all)
         self.enable_name_heuristic = bool(enable_name_heuristic)
         self.enable_mesh_detection = bool(enable_mesh_detection)
+        self.enable_live_set = bool(enable_live_set)
         self.collect_draw_names = bool(collect_draw_names)
         self.max_draw_names_per_buffer = max(0, int(max_draw_names_per_buffer))
         self.large_resource_threshold_bytes = (
@@ -88,10 +92,18 @@ class _VramEstimator:
     def run(self):
         # Resource usage is precomputed by RenderDoc during replay init, so
         # GetUsage() is a cheap lookup (no per-event replay). One pass over it
-        # feeds both render-target classification and mesh-buffer detection.
+        # feeds render-target classification, mesh-buffer detection, the
+        # live-set peak estimate, and the unreferenced-resource list.
         self._usage_by_rid = self._collect_usage_by_rid()
 
         rows, counts = self._collect_resource_rows()
+
+        # Built once (no replay) and shared by mesh annotation and live-set so
+        # the action walk is not repeated.
+        name_by_event = {}
+        if self.collect_draw_names or self.enable_live_set:
+            name_by_event = self._build_event_name_map()
+
         mesh_stats = {
             "enabled": self.enable_mesh_detection,
             "method": "GetUsage",
@@ -100,10 +112,13 @@ class _VramEstimator:
         }
 
         if self.enable_mesh_detection:
-            geometry_usage, mesh_stats = self._derive_geometry_usage()
+            geometry_usage, mesh_stats = self._derive_geometry_usage(name_by_event)
             rows = self._annotate_mesh_buffers(rows, geometry_usage)
 
-        return self._build_report(rows, counts, mesh_stats)
+        live_set = self._compute_live_set(rows, name_by_event) if self.enable_live_set else None
+        unreferenced = self._collect_unreferenced(rows) if self.enable_live_set else None
+
+        return self._build_report(rows, counts, mesh_stats, live_set, unreferenced)
 
     def _collect_usage_by_rid(self):
         """Map each resource id to its RenderDoc usage roles and event ids.
@@ -115,10 +130,10 @@ class _VramEstimator:
         how each resource is actually bound.
         """
         usage_by_rid = {}
-        if not self.enable_mesh_detection:
-            # The usage pass only powers mesh detection and usage-based RT
-            # classification; skip it entirely when mesh detection is off so
-            # behaviour matches the name-heuristic-only mode.
+        if not (self.enable_mesh_detection or self.enable_live_set):
+            # The usage pass powers mesh detection, usage-based RT
+            # classification, the live-set estimate, and unreferenced detection;
+            # skip it only when all of those are disabled.
             return usage_by_rid
 
         resources = []
@@ -433,7 +448,7 @@ class _VramEstimator:
             return "RT/Color"
         return None
 
-    def _derive_geometry_usage(self):
+    def _derive_geometry_usage(self, name_by_event):
         """Build mesh geometry usage from the precomputed GetUsage map.
 
         Maps RenderDoc usage tokens to VB/IB roles and records the draw events
@@ -448,8 +463,6 @@ class _VramEstimator:
                 "attrs": set(),
             }
         )
-
-        name_by_event = self._build_event_name_map() if self.collect_draw_names else {}
 
         for rid_s, info in self._usage_by_rid.items():
             roles = set()
@@ -537,7 +550,109 @@ class _VramEstimator:
 
         return rows
 
-    def _build_report(self, rows, counts, mesh_stats):
+    def _compute_live_set(self, rows, name_by_event):
+        """Estimate the peak simultaneously-live resource memory across the frame.
+
+        Each resource's usage lifetime is approximated by the [first, last] span
+        of the events that reference it (from GetUsage). A sweep line over those
+        intervals yields, for every event, the sum of bytes of all resources
+        whose lifetime covers it; the maximum is the peak working-set estimate.
+
+        Unlike the naive grand total this does NOT double-count resources whose
+        lifetimes never overlap (e.g. pooled/transient render targets that the
+        engine reuses), so it is a closer proxy for real VRAM pressure. It is
+        still an estimate: it reflects usage liveness, not driver allocation
+        liveness or heap aliasing, and resources with usage gaps are treated as
+        live across the whole gap.
+        """
+        # (event, delta) deltas: +bytes when a resource enters, -bytes after it
+        # leaves. Subtractions at a coordinate are applied before additions so
+        # back-to-back lifetimes (lastA + 1 == firstB) do not falsely overlap.
+        deltas = []
+        considered = 0
+        lifetimes = []  # (first, last, row) kept for the peak-event breakdown
+        for row in rows:
+            info = self._usage_by_rid.get(row.get("resource_id"))
+            if not info or not info["events"]:
+                continue
+            size = row.get("bytes", 0)
+            if size <= 0:
+                continue
+            first = min(info["events"])
+            last = max(info["events"])
+            deltas.append((first, 1, size))   # enter (sort key 1 = after leaves)
+            deltas.append((last + 1, 0, -size))  # leave (sort key 0 = first)
+            lifetimes.append((first, last, row))
+            considered += 1
+
+        peak_bytes = 0
+        peak_event = None
+        running = 0
+        for event_id, _order, delta in sorted(deltas, key=lambda d: (d[0], d[1])):
+            running += delta
+            if running > peak_bytes:
+                peak_bytes = running
+                peak_event = event_id
+
+        # Category breakdown of the resources alive at the peak event.
+        peak_by_category = defaultdict(int)
+        peak_count = 0
+        if peak_event is not None:
+            for first, last, row in lifetimes:
+                if first <= peak_event <= last:
+                    peak_by_category[row["category"]] += row["bytes"]
+                    peak_count += 1
+
+        peak_categories = [
+            {
+                "category": category,
+                "bytes": size,
+                "mib": round(mib(size), 4),
+                "percent": round((100.0 * size / peak_bytes) if peak_bytes > 0 else 0.0, 4),
+            }
+            for category, size in sorted(peak_by_category.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+        grand = sum(row.get("bytes", 0) for row in rows)
+        return {
+            "peak_bytes": peak_bytes,
+            "peak_mib": round(mib(peak_bytes), 4),
+            "peak_gib": round(gib(peak_bytes), 6),
+            "peak_event_id": peak_event,
+            "peak_event_name": name_by_event.get(peak_event, "") if peak_event is not None else "",
+            "peak_live_resources": peak_count,
+            "percent_of_grand_total": round((100.0 * peak_bytes / grand) if grand > 0 else 0.0, 4),
+            "resources_considered": considered,
+            "peak_categories": peak_categories,
+            "note": "Peak of simultaneously-live resources by usage lifetime; lower than the grand total by the amount of non-overlapping transient/pooled memory.",
+        }
+
+    def _collect_unreferenced(self, rows):
+        """List resources never referenced by any event in the captured frame.
+
+        A resource is reported as unreferenced when GetUsage returned no events
+        for it. These are candidates for wasted memory, but the list may also
+        include legitimately idle resources (staging/upload buffers, the current
+        backbuffer before first use) and any resource whose usage query failed.
+        """
+        unreferenced = [
+            row
+            for row in rows
+            if not self._usage_by_rid.get(row.get("resource_id"), {}).get("events")
+        ]
+        unreferenced.sort(key=lambda row: row.get("bytes", 0), reverse=True)
+
+        total_bytes = sum(row.get("bytes", 0) for row in unreferenced)
+        limit = len(unreferenced) if self.show_all else self.top_n
+        return {
+            "count": len(unreferenced),
+            "total_bytes": total_bytes,
+            "total_mib": round(mib(total_bytes), 4),
+            "note": "Resources with no recorded usage in this frame; may include idle/staging resources or failed usage queries, not only waste.",
+            "top_resources": [compact_row(row) for row in unreferenced[:limit]],
+        }
+
+    def _build_report(self, rows, counts, mesh_stats, live_set=None, unreferenced=None):
         rows_sorted = sorted(rows, key=lambda row: row.get("bytes", 0), reverse=True)
         total_by_kind = defaultdict(int)
         total_by_category = defaultdict(int)
@@ -599,6 +714,7 @@ class _VramEstimator:
                 "show_all": self.show_all,
                 "enable_name_heuristic": self.enable_name_heuristic,
                 "enable_mesh_detection": self.enable_mesh_detection,
+                "enable_live_set": self.enable_live_set,
                 "collect_draw_names": self.collect_draw_names,
                 "max_draw_names_per_buffer": self.max_draw_names_per_buffer,
                 "large_resource_threshold_mb": self.large_resource_threshold_bytes // (1024 * 1024),
@@ -622,13 +738,16 @@ class _VramEstimator:
                 "categories": mesh_categories,
                 "top_resources": [compact_row(row) for row in mesh_rows[:limit]],
             },
+            "live_set": live_set,
+            "unreferenced": unreferenced,
             "top_resources": [compact_row(row) for row in rows_sorted[:limit]],
             "large_resources": [compact_row(row) for row in large_resources],
             "notes": [
                 "Driver private allocations, heap padding/alignment, compression metadata, descriptor heaps, shader caches, command allocators, query heaps, and RenderDoc replay overhead are not included.",
-                "Summing resources can exceed real frame peak memory when transient resources alias.",
+                "Summing resources can exceed real frame peak memory when transient resources alias; see live_set.peak_bytes for a tighter peak estimate.",
                 "Sparse, tiled, virtual, or partially resident resources may be overestimated from their visible descriptions.",
                 "Mesh buffer categories and render-target classification are derived from RenderDoc resource usage (GetUsage); per-instance vertex streams are reported as vertex buffers.",
+                "live_set is a peak working-set estimate from usage lifetimes (not driver allocation lifetimes); unreferenced lists resources with no recorded usage this frame.",
             ],
         }
 
