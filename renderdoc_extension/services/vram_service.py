@@ -599,6 +599,47 @@ class _VramEstimator:
 
         return peak_bytes, peak_event, lifetimes
 
+    def _build_live_timeline(self, lifetimes, name_by_event):
+        """Build a compact event timeline from sweep-line lifetime deltas."""
+        deltas = []
+        for first, last, row in lifetimes:
+            size = row.get("bytes", 0)
+            if size <= 0:
+                continue
+            deltas.append((first, 1, size))
+            deltas.append((last + 1, 0, -size))
+
+        timeline = []
+        running = 0
+        current_event = None
+        pending_delta = 0
+        for event_id, order, delta in sorted(deltas, key=lambda d: (d[0], d[1])):
+            if current_event is not None and event_id != current_event:
+                if pending_delta:
+                    running += pending_delta
+                    timeline.append(
+                        {
+                            "event_id": current_event,
+                            "bytes": running,
+                            "mib": round(mib(running), 4),
+                            "event_name": name_by_event.get(current_event, ""),
+                        }
+                    )
+                    pending_delta = 0
+            current_event = event_id
+            pending_delta += delta
+        if current_event is not None and pending_delta:
+            running += pending_delta
+            timeline.append(
+                {
+                    "event_id": current_event,
+                    "bytes": running,
+                    "mib": round(mib(running), 4),
+                    "event_name": name_by_event.get(current_event, ""),
+                }
+            )
+        return timeline
+
     def _compute_live_set(self, rows, name_by_event):
         """Estimate the peak simultaneously-live resource memory across the frame.
 
@@ -619,11 +660,13 @@ class _VramEstimator:
         # Category breakdown of the resources alive at the peak event.
         peak_by_category = defaultdict(int)
         peak_count = 0
+        peak_rows = []
         if peak_event is not None:
             for first, last, row in lifetimes:
                 if first <= peak_event <= last:
                     peak_by_category[row["category"]] += row["bytes"]
                     peak_count += 1
+                    peak_rows.append(row)
 
         peak_categories = [
             {
@@ -636,6 +679,8 @@ class _VramEstimator:
         ]
 
         grand = sum(row.get("bytes", 0) for row in rows)
+        peak_rows.sort(key=lambda row: row.get("bytes", 0), reverse=True)
+        peak_limit = len(peak_rows) if self.show_all else self.top_n
         return {
             "peak_bytes": peak_bytes,
             "peak_mib": round(mib(peak_bytes), 4),
@@ -646,6 +691,8 @@ class _VramEstimator:
             "percent_of_grand_total": round((100.0 * peak_bytes / grand) if grand > 0 else 0.0, 4),
             "resources_considered": considered,
             "peak_categories": peak_categories,
+            "peak_resources": [compact_row(row) for row in peak_rows[:peak_limit]],
+            "timeline": self._build_live_timeline(lifetimes, name_by_event),
             "note": "Peak of simultaneously-live resources by usage lifetime; lower than the grand total by the amount of non-overlapping transient/pooled memory.",
         }
 

@@ -301,6 +301,7 @@ def estimate_vram(
         mesh: 几何 Buffer(VB/IB)的分类汇总与 Top 列表。
         live_set: 按使用生命周期估算的【同时存活峰值】(peak_bytes)、峰值所在 event 及其
             构成；生命周期不重叠的瞬态资源不会被重复计入，比全量和更接近显存压力下界。
+            timeline 给出随 event 变化的工作集曲线，peak_resources 列出峰值时刻存活资源。
         residency: 【驻留拆解】将驻留分为 persistent(真持久, 只能缩) + transient(瞬态,
             可池化) + unreferenced(未引用, 可释放)，三者之和等于全量和。其中
             transient.pooled_peak = 瞬态集完美复用后所需内存，poolable_headroom = 可由
