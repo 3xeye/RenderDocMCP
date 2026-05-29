@@ -261,6 +261,46 @@ def get_texture_data(
 
 
 @mcp.tool
+def estimate_vram(
+    top_n: int = 100,
+    show_all: bool = False,
+    enable_name_heuristic: bool = True,
+    enable_mesh_detection: bool = True,
+    collect_draw_names: bool = True,
+    max_draw_names_per_buffer: int = 8,
+    large_resource_threshold_mb: int = 128,
+) -> dict:
+    """
+    Estimate API-visible captured texture/buffer memory and mesh geometry buffers.
+
+    Args:
+        top_n: Maximum number of resources to include in top lists.
+        show_all: Include all resource rows instead of limiting to top_n.
+        enable_name_heuristic: Use resource names to classify RT/VT/buffer categories.
+        enable_mesh_detection: Walk draw calls and inspect VB/IB/instance bindings.
+        collect_draw_names: Include example draw names in mesh buffer notes.
+        max_draw_names_per_buffer: Limit draw names stored per mesh buffer.
+        large_resource_threshold_mb: Threshold for large resource hints.
+
+    Returns structured totals, category breakdowns, mesh summaries, top resources,
+    and scope notes. This is an estimate of API-visible captured resources, not
+    exact driver VRAM usage.
+    """
+    return bridge.call(
+        "estimate_vram",
+        {
+            "top_n": top_n,
+            "show_all": show_all,
+            "enable_name_heuristic": enable_name_heuristic,
+            "enable_mesh_detection": enable_mesh_detection,
+            "collect_draw_names": collect_draw_names,
+            "max_draw_names_per_buffer": max_draw_names_per_buffer,
+            "large_resource_threshold_mb": large_resource_threshold_mb,
+        },
+    )
+
+
+@mcp.tool
 def get_pipeline_state(event_id: int) -> dict:
     """
     Get the full graphics pipeline state at a specific event.

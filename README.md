@@ -90,6 +90,7 @@ uv tool update-shell  # PATHに追加
 | `get_buffer_contents` | バッファの内容を取得 (Base64) |
 | `get_texture_info` | テクスチャのメタデータを取得 |
 | `get_texture_data` | テクスチャのピクセルデータを取得 (Base64) |
+| `estimate_vram` | API可視リソースのVRAM推定とMesh VB/IB/Instance Buffer検出 |
 | `get_pipeline_state` | パイプライン状態を取得 |
 
 ## 使用例
@@ -111,6 +112,14 @@ get_shader_info(event_id=123, stage="pixel")
 ```
 get_pipeline_state(event_id=123)
 ```
+
+### VRAM推定
+
+```
+estimate_vram(top_n=100, enable_mesh_detection=true)
+```
+
+`estimate_vram` は RenderDoc capture 内の API 可視 Texture / Buffer を列挙し、Texture/RT/Depth/Swapchain、Buffer、Mesh Vertex/Index/Instance Buffer のカテゴリ別集計を返す。これはドライバの正確なVRAM使用量ではなく、RenderDocから見えるリソース記述に基づく推定値。
 
 ### テクスチャデータの取得
 

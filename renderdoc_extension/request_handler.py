@@ -25,6 +25,7 @@ class RequestHandler:
             "get_buffer_contents": self._handle_get_buffer_contents,
             "get_texture_info": self._handle_get_texture_info,
             "get_texture_data": self._handle_get_texture_data,
+            "estimate_vram": self._handle_estimate_vram,
             "get_pipeline_state": self._handle_get_pipeline_state,
             "list_captures": self._handle_list_captures,
             "open_capture": self._handle_open_capture,
@@ -162,6 +163,18 @@ class RequestHandler:
         sample = params.get("sample", 0)
         depth_slice = params.get("depth_slice")  # None = full volume
         return self.facade.get_texture_data(resource_id, mip, slice_idx, sample, depth_slice)
+
+    def _handle_estimate_vram(self, params):
+        """Handle estimate_vram request"""
+        return self.facade.estimate_vram(
+            top_n=params.get("top_n", 100),
+            show_all=params.get("show_all", False),
+            enable_name_heuristic=params.get("enable_name_heuristic", True),
+            enable_mesh_detection=params.get("enable_mesh_detection", True),
+            collect_draw_names=params.get("collect_draw_names", True),
+            max_draw_names_per_buffer=params.get("max_draw_names_per_buffer", 8),
+            large_resource_threshold_mb=params.get("large_resource_threshold_mb", 128),
+        )
 
     def _handle_get_pipeline_state(self, params):
         """Handle get_pipeline_state request"""

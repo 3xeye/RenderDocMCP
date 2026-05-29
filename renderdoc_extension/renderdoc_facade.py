@@ -10,6 +10,7 @@ from .services import (
     SearchService,
     ResourceService,
     PipelineService,
+    VramService,
 )
 
 
@@ -23,6 +24,7 @@ class RenderDocFacade:
     - SearchService: Reverse lookup searches
     - ResourceService: Texture and buffer data
     - PipelineService: Pipeline state and shader info
+    - VramService: API-visible captured resource memory estimates
     """
 
     def __init__(self, ctx):
@@ -40,6 +42,7 @@ class RenderDocFacade:
         self._search = SearchService(ctx, self._invoke)
         self._resource = ResourceService(ctx, self._invoke)
         self._pipeline = PipelineService(ctx, self._invoke)
+        self._vram = VramService(ctx, self._invoke)
 
     def _invoke(self, callback):
         """Invoke callback on replay thread via BlockInvoke"""
@@ -125,6 +128,27 @@ class RenderDocFacade:
     def get_texture_data(self, resource_id, mip=0, slice=0, sample=0, depth_slice=None):
         """Get texture pixel data"""
         return self._resource.get_texture_data(resource_id, mip, slice, sample, depth_slice)
+
+    def estimate_vram(
+        self,
+        top_n=100,
+        show_all=False,
+        enable_name_heuristic=True,
+        enable_mesh_detection=True,
+        collect_draw_names=True,
+        max_draw_names_per_buffer=8,
+        large_resource_threshold_mb=128,
+    ):
+        """Estimate API-visible captured resource memory and mesh buffers."""
+        return self._vram.estimate_vram(
+            top_n=top_n,
+            show_all=show_all,
+            enable_name_heuristic=enable_name_heuristic,
+            enable_mesh_detection=enable_mesh_detection,
+            collect_draw_names=collect_draw_names,
+            max_draw_names_per_buffer=max_draw_names_per_buffer,
+            large_resource_threshold_mb=large_resource_threshold_mb,
+        )
 
     # ==================== Pipeline Operations ====================
 
