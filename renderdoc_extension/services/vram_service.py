@@ -23,6 +23,7 @@ class VramService:
         enable_name_heuristic=True,
         enable_mesh_detection=True,
         enable_live_set=True,
+        persistent_span_ratio=0.5,
         collect_draw_names=True,
         max_draw_names_per_buffer=8,
         large_resource_threshold_mb=128,
@@ -43,6 +44,7 @@ class VramService:
                     enable_name_heuristic=enable_name_heuristic,
                     enable_mesh_detection=enable_mesh_detection,
                     enable_live_set=enable_live_set,
+                    persistent_span_ratio=persistent_span_ratio,
                     collect_draw_names=collect_draw_names,
                     max_draw_names_per_buffer=max_draw_names_per_buffer,
                     large_resource_threshold_mb=large_resource_threshold_mb,
@@ -70,6 +72,7 @@ class _VramEstimator:
         enable_name_heuristic=True,
         enable_mesh_detection=True,
         enable_live_set=True,
+        persistent_span_ratio=0.5,
         collect_draw_names=True,
         max_draw_names_per_buffer=8,
         large_resource_threshold_mb=128,
@@ -81,6 +84,10 @@ class _VramEstimator:
         self.enable_name_heuristic = bool(enable_name_heuristic)
         self.enable_mesh_detection = bool(enable_mesh_detection)
         self.enable_live_set = bool(enable_live_set)
+        # Fraction of the frame's event span a resource must cover (by usage
+        # lifetime) to be classed as persistent rather than a transient/poolable
+        # candidate. Clamped to [0, 1].
+        self.persistent_span_ratio = min(1.0, max(0.0, float(persistent_span_ratio)))
         self.collect_draw_names = bool(collect_draw_names)
         self.max_draw_names_per_buffer = max(0, int(max_draw_names_per_buffer))
         self.large_resource_threshold_bytes = (
@@ -115,10 +122,15 @@ class _VramEstimator:
             geometry_usage, mesh_stats = self._derive_geometry_usage(name_by_event)
             rows = self._annotate_mesh_buffers(rows, geometry_usage)
 
-        live_set = self._compute_live_set(rows, name_by_event) if self.enable_live_set else None
-        unreferenced = self._collect_unreferenced(rows) if self.enable_live_set else None
+        live_set = None
+        residency = None
+        unreferenced = None
+        if self.enable_live_set:
+            live_set = self._compute_live_set(rows, name_by_event)
+            residency = self._compute_residency(rows)
+            unreferenced = self._collect_unreferenced(rows)
 
-        return self._build_report(rows, counts, mesh_stats, live_set, unreferenced)
+        return self._build_report(rows, counts, mesh_stats, live_set, unreferenced, residency)
 
     def _collect_usage_by_rid(self):
         """Map each resource id to its RenderDoc usage roles and event ids.
@@ -550,27 +562,19 @@ class _VramEstimator:
 
         return rows
 
-    def _compute_live_set(self, rows, name_by_event):
-        """Estimate the peak simultaneously-live resource memory across the frame.
+    def _sweep_live_peak(self, rows):
+        """Sweep-line peak of simultaneously-live bytes over the given rows.
 
-        Each resource's usage lifetime is approximated by the [first, last] span
-        of the events that reference it (from GetUsage). A sweep line over those
-        intervals yields, for every event, the sum of bytes of all resources
-        whose lifetime covers it; the maximum is the peak working-set estimate.
-
-        Unlike the naive grand total this does NOT double-count resources whose
-        lifetimes never overlap (e.g. pooled/transient render targets that the
-        engine reuses), so it is a closer proxy for real VRAM pressure. It is
-        still an estimate: it reflects usage liveness, not driver allocation
-        liveness or heap aliasing, and resources with usage gaps are treated as
-        live across the whole gap.
+        Each resource's lifetime is approximated by the [first, last] span of the
+        events that reference it (from GetUsage). Returns
+        (peak_bytes, peak_event, lifetimes) where lifetimes is the list of
+        (first, last, row) for rows that have usage and positive size.
         """
-        # (event, delta) deltas: +bytes when a resource enters, -bytes after it
+        # (event, order, delta): +bytes when a resource enters, -bytes after it
         # leaves. Subtractions at a coordinate are applied before additions so
         # back-to-back lifetimes (lastA + 1 == firstB) do not falsely overlap.
         deltas = []
-        considered = 0
-        lifetimes = []  # (first, last, row) kept for the peak-event breakdown
+        lifetimes = []
         for row in rows:
             info = self._usage_by_rid.get(row.get("resource_id"))
             if not info or not info["events"]:
@@ -580,10 +584,9 @@ class _VramEstimator:
                 continue
             first = min(info["events"])
             last = max(info["events"])
-            deltas.append((first, 1, size))   # enter (sort key 1 = after leaves)
-            deltas.append((last + 1, 0, -size))  # leave (sort key 0 = first)
+            deltas.append((first, 1, size))      # enter (order 1 = after leaves)
+            deltas.append((last + 1, 0, -size))  # leave (order 0 = first)
             lifetimes.append((first, last, row))
-            considered += 1
 
         peak_bytes = 0
         peak_event = None
@@ -593,6 +596,25 @@ class _VramEstimator:
             if running > peak_bytes:
                 peak_bytes = running
                 peak_event = event_id
+
+        return peak_bytes, peak_event, lifetimes
+
+    def _compute_live_set(self, rows, name_by_event):
+        """Estimate the peak simultaneously-live resource memory across the frame.
+
+        A sweep line over usage lifetimes yields, for every event, the sum of
+        bytes of all resources whose lifetime covers it; the maximum is the peak
+        working-set estimate.
+
+        Unlike the naive grand total this does NOT double-count resources whose
+        lifetimes never overlap (e.g. pooled/transient render targets that the
+        engine reuses), so it is a closer proxy for real VRAM pressure. It is
+        still an estimate: it reflects usage liveness, not driver allocation
+        liveness or heap aliasing, and resources with usage gaps are treated as
+        live across the whole gap.
+        """
+        peak_bytes, peak_event, lifetimes = self._sweep_live_peak(rows)
+        considered = len(lifetimes)
 
         # Category breakdown of the resources alive at the peak event.
         peak_by_category = defaultdict(int)
@@ -627,6 +649,103 @@ class _VramEstimator:
             "note": "Peak of simultaneously-live resources by usage lifetime; lower than the grand total by the amount of non-overlapping transient/pooled memory.",
         }
 
+    def _compute_residency(self, rows):
+        """Split resident memory into persistent vs transient (poolable) parts.
+
+        Answers "of all this resident memory, how much could be reclaimed?".
+        Every referenced resource is classed by how much of the frame its usage
+        lifetime spans:
+
+        - persistent: span covers >= persistent_span_ratio of the frame. It must
+          stay resident throughout, so it can only be shrunk (smaller format /
+          resolution / pool-size settings), not pooled away.
+        - transient: a short-lived candidate whose memory could be reused by
+          another non-overlapping transient resource.
+
+        Running the sweep-line peak over only the transient set gives the memory
+        that set would need if perfectly pooled; the difference from its naive
+        sum is the poolable headroom. Combined with the persistent floor and the
+        unreferenced bytes this yields a theoretical minimum resident estimate
+        and an upper bound on what is reducible.
+
+        Caveats: this is usage-lifetime liveness, not driver allocation
+        liveness; the "reducible" figure is an optimistic upper bound that
+        assumes perfect pooling and that the engine does not already alias these
+        resources.
+        """
+        all_events = set()
+        for info in self._usage_by_rid.values():
+            all_events.update(info["events"])
+        if not all_events:
+            return None
+
+        frame_min = min(all_events)
+        frame_max = max(all_events)
+        frame_span = max(1, frame_max - frame_min)
+
+        persistent_rows = []
+        transient_rows = []
+        for row in rows:
+            info = self._usage_by_rid.get(row.get("resource_id"))
+            if not info or not info["events"]:
+                continue  # unreferenced; reported separately
+            span = max(info["events"]) - min(info["events"])
+            if (float(span) / frame_span) >= self.persistent_span_ratio:
+                persistent_rows.append(row)
+            else:
+                transient_rows.append(row)
+
+        persistent_bytes = sum(row.get("bytes", 0) for row in persistent_rows)
+        transient_bytes = sum(row.get("bytes", 0) for row in transient_rows)
+        transient_peak, _peak_event, _lifetimes = self._sweep_live_peak(transient_rows)
+        poolable_headroom = max(0, transient_bytes - transient_peak)
+
+        unreferenced_bytes = sum(
+            row.get("bytes", 0)
+            for row in rows
+            if not self._usage_by_rid.get(row.get("resource_id"), {}).get("events")
+        )
+        grand = sum(row.get("bytes", 0) for row in rows)
+        theoretical_min = persistent_bytes + transient_peak
+        reducible = max(0, grand - theoretical_min)  # = poolable_headroom + unreferenced_bytes
+
+        persistent_rows.sort(key=lambda row: row.get("bytes", 0), reverse=True)
+        transient_rows.sort(key=lambda row: row.get("bytes", 0), reverse=True)
+        p_limit = len(persistent_rows) if self.show_all else self.top_n
+        t_limit = len(transient_rows) if self.show_all else self.top_n
+
+        return {
+            "frame_event_range": [frame_min, frame_max],
+            "persistent_span_ratio": self.persistent_span_ratio,
+            "persistent": {
+                "bytes": persistent_bytes,
+                "mib": round(mib(persistent_bytes), 4),
+                "count": len(persistent_rows),
+                "percent_of_grand_total": round((100.0 * persistent_bytes / grand) if grand > 0 else 0.0, 4),
+                "comment": "Resident throughout the frame; reduce via smaller format/resolution or pool-size settings.",
+                "top_resources": [compact_row(row) for row in persistent_rows[:p_limit]],
+            },
+            "transient": {
+                "bytes": transient_bytes,
+                "mib": round(mib(transient_bytes), 4),
+                "count": len(transient_rows),
+                "percent_of_grand_total": round((100.0 * transient_bytes / grand) if grand > 0 else 0.0, 4),
+                "pooled_peak_bytes": transient_peak,
+                "pooled_peak_mib": round(mib(transient_peak), 4),
+                "poolable_headroom_bytes": poolable_headroom,
+                "poolable_headroom_mib": round(mib(poolable_headroom), 4),
+                "comment": "Short-lived; pooled_peak is what this set needs if perfectly reused, poolable_headroom is what pooling could reclaim.",
+                "top_resources": [compact_row(row) for row in transient_rows[:t_limit]],
+            },
+            "unreferenced_bytes": unreferenced_bytes,
+            "unreferenced_mib": round(mib(unreferenced_bytes), 4),
+            "theoretical_min_resident_bytes": theoretical_min,
+            "theoretical_min_resident_mib": round(mib(theoretical_min), 4),
+            "reducible_upper_bound_bytes": reducible,
+            "reducible_upper_bound_mib": round(mib(reducible), 4),
+            "note": "Optimistic decomposition by usage lifetime: persistent (shrink-only) + transient (poolable) + unreferenced (freeable). reducible_upper_bound = poolable_headroom + unreferenced assumes perfect pooling and no existing engine aliasing.",
+        }
+
     def _collect_unreferenced(self, rows):
         """List resources never referenced by any event in the captured frame.
 
@@ -652,7 +771,7 @@ class _VramEstimator:
             "top_resources": [compact_row(row) for row in unreferenced[:limit]],
         }
 
-    def _build_report(self, rows, counts, mesh_stats, live_set=None, unreferenced=None):
+    def _build_report(self, rows, counts, mesh_stats, live_set=None, unreferenced=None, residency=None):
         rows_sorted = sorted(rows, key=lambda row: row.get("bytes", 0), reverse=True)
         total_by_kind = defaultdict(int)
         total_by_category = defaultdict(int)
@@ -715,6 +834,7 @@ class _VramEstimator:
                 "enable_name_heuristic": self.enable_name_heuristic,
                 "enable_mesh_detection": self.enable_mesh_detection,
                 "enable_live_set": self.enable_live_set,
+                "persistent_span_ratio": self.persistent_span_ratio,
                 "collect_draw_names": self.collect_draw_names,
                 "max_draw_names_per_buffer": self.max_draw_names_per_buffer,
                 "large_resource_threshold_mb": self.large_resource_threshold_bytes // (1024 * 1024),
@@ -739,6 +859,7 @@ class _VramEstimator:
                 "top_resources": [compact_row(row) for row in mesh_rows[:limit]],
             },
             "live_set": live_set,
+            "residency": residency,
             "unreferenced": unreferenced,
             "top_resources": [compact_row(row) for row in rows_sorted[:limit]],
             "large_resources": [compact_row(row) for row in large_resources],
@@ -748,6 +869,7 @@ class _VramEstimator:
                 "Sparse, tiled, virtual, or partially resident resources may be overestimated from their visible descriptions.",
                 "Mesh buffer categories and render-target classification are derived from RenderDoc resource usage (GetUsage); per-instance vertex streams are reported as vertex buffers.",
                 "live_set is a peak working-set estimate from usage lifetimes (not driver allocation lifetimes); unreferenced lists resources with no recorded usage this frame.",
+                "residency splits resident memory into persistent (shrink-only) vs transient (poolable) and estimates a reducible upper bound; persistent + transient + unreferenced == grand total.",
             ],
         }
 

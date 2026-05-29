@@ -247,6 +247,45 @@ def run():
     failures += not _check("unreferenced bytes", unref["total_bytes"], 999)
     failures += not _check("unreferenced top rid", unref["top_resources"][0]["resource_id"], "D")
 
+    # --- residency 驻留拆解 (持久 vs 瞬态 vs 未引用) ---
+    # 帧事件跨度 [1,100]=99。阈值0.5 → span>=49.5 判持久。
+    #   P: events{1,100} span99 → 持久, 1000B
+    #   T1: {1,2} span1 → 瞬态, 100B, 区间[1,2]
+    #   T2: {50,51} span1 → 瞬态, 200B, 区间[50,51] (与T1不重叠)
+    #   T3: {1,2} span1 → 瞬态, 50B, 区间[1,2] (与T1重叠)
+    #   U: 无usage → 未引用, 999B
+    rs_est = vram._VramEstimator(ctx=None, controller=None, enable_live_set=True, persistent_span_ratio=0.5)
+    rs_est._usage_by_rid = {
+        "P": {"roles": set(), "events": {1, 100}},
+        "T1": {"roles": set(), "events": {1, 2}},
+        "T2": {"roles": set(), "events": {50, 51}},
+        "T3": {"roles": set(), "events": {1, 2}},
+    }
+    rs_rows = [
+        {"kind": "Buffer", "category": "Buffer/UAV-Structured", "resource_id": "P", "bytes": 1000},
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "T1", "bytes": 100},
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "T2", "bytes": 200},
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "T3", "bytes": 50},
+        {"kind": "Texture", "category": "Texture/Regular", "resource_id": "U", "bytes": 999},
+    ]
+    res = rs_est._compute_residency(rs_rows)
+    failures += not _check("residency frame range", res["frame_event_range"], [1, 100])
+    failures += not _check("persistent bytes", res["persistent"]["bytes"], 1000)
+    failures += not _check("persistent count", res["persistent"]["count"], 1)
+    failures += not _check("transient bytes", res["transient"]["bytes"], 350)
+    failures += not _check("transient count", res["transient"]["count"], 3)
+    # 瞬态峰值: T1+T3=150 @ [1,2] vs T2=200 @ [50,51] → 200
+    failures += not _check("transient pooled peak", res["transient"]["pooled_peak_bytes"], 200)
+    failures += not _check("poolable headroom (350-200)", res["transient"]["poolable_headroom_bytes"], 150)
+    failures += not _check("unreferenced bytes", res["unreferenced_bytes"], 999)
+    # 理论最小驻留 = persistent(1000) + 瞬态峰值(200) = 1200
+    failures += not _check("theoretical min resident", res["theoretical_min_resident_bytes"], 1200)
+    # 可省上限 = grand(2349) - 1200 = 1149 = poolable(150)+unref(999)
+    failures += not _check("reducible upper bound", res["reducible_upper_bound_bytes"], 1149)
+    # 三段之和 == 全量和 (自洽校验)
+    parts = res["persistent"]["bytes"] + res["transient"]["bytes"] + res["unreferenced_bytes"]
+    failures += not _check("persistent+transient+unref == grand", parts, 2349)
+
     print("\n%d failure(s)" % failures)
     return failures
 

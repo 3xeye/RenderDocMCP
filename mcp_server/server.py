@@ -267,28 +267,47 @@ def estimate_vram(
     enable_name_heuristic: bool = True,
     enable_mesh_detection: bool = True,
     enable_live_set: bool = True,
+    persistent_span_ratio: float = 0.5,
     collect_draw_names: bool = True,
     max_draw_names_per_buffer: int = 8,
     large_resource_threshold_mb: int = 128,
 ) -> dict:
     """
-    Estimate API-visible captured texture/buffer memory and mesh geometry buffers.
+    估算当前 RenderDoc 截帧中 API 可见的纹理/Buffer 显存占用，并按用途分类分析。
 
-    Args:
-        top_n: Maximum number of resources to include in top lists.
-        show_all: Include all resource rows instead of limiting to top_n.
-        enable_name_heuristic: Use resource names to classify RT/VT/buffer categories.
-        enable_mesh_detection: Use RenderDoc usage data to classify VB/IB geometry buffers.
-        enable_live_set: Compute the peak simultaneously-live working set and list
-            unreferenced resources from usage lifetimes.
-        collect_draw_names: Include example draw names in mesh buffer notes.
-        max_draw_names_per_buffer: Limit draw names stored per mesh buffer.
-        large_resource_threshold_mb: Threshold for large resource hints.
+    这是基于 RenderDoc 可见资源描述的【估算值】，不是驱动真实 VRAM 占用：不含驱动私有
+    分配、堆对齐/填充、压缩元数据、描述符堆、着色器缓存、命令分配器等开销。
 
-    Returns structured totals, category breakdowns, mesh summaries, a live_set
-    peak-memory estimate, an unreferenced-resource list, top resources, and scope
-    notes. This is an estimate of API-visible captured resources, not exact driver
-    VRAM usage.
+    参数:
+        top_n: 各 Top 列表最多包含的资源数。
+        show_all: 返回全部资源行，忽略 top_n 限制。
+        enable_name_heuristic: 用资源名启发式辅助分类 RT/虚拟纹理/Buffer。
+        enable_mesh_detection: 用 RenderDoc 使用数据(GetUsage)识别 VB/IB 几何 Buffer。
+        enable_live_set: 计算同时存活峰值(live_set)、驻留拆解(residency)与未引用资源
+            (unreferenced)；关闭可跳过这部分使用数据扫描。
+        persistent_span_ratio: 驻留拆解阈值[0,1]。资源使用区间覆盖帧事件跨度的比例 >= 该
+            值则判为"真持久(只能缩)"，否则为"瞬态候选(可池化)"。默认 0.5。
+        collect_draw_names: 在 Mesh Buffer 备注中附带示例 drawcall 名。
+        max_draw_names_per_buffer: 每个 Mesh Buffer 记录的 draw 名上限。
+        large_resource_threshold_mb: 大资源提示阈值(MiB)。
+
+    返回 dict，主要字段:
+        totals: 全量和(grand_bytes)及纹理/Buffer 小计。在 D3D11 等驱动管理驻留的场景，
+            实际驻留更接近此全量和而非峰值。
+        categories: 按用途分类(RT/Color、RT/DepthStencil、Texture/*、Buffer/* 等)的合计。
+        mesh: 几何 Buffer(VB/IB)的分类汇总与 Top 列表。
+        live_set: 按使用生命周期估算的【同时存活峰值】(peak_bytes)、峰值所在 event 及其
+            构成；生命周期不重叠的瞬态资源不会被重复计入，比全量和更接近显存压力下界。
+        residency: 【驻留拆解】将驻留分为 persistent(真持久, 只能缩) + transient(瞬态,
+            可池化) + unreferenced(未引用, 可释放)，三者之和等于全量和。其中
+            transient.pooled_peak = 瞬态集完美复用后所需内存，poolable_headroom = 可由
+            池化回收的量；theoretical_min_resident = persistent + 瞬态峰值；
+            reducible_upper_bound = poolable_headroom + 未引用 = 理论可省上限(乐观假设)。
+        unreferenced: 本帧从未被引用(GetUsage 为空)的资源，可能含上传暂存/空闲资源。
+        top_resources / large_resources: 按字节数排序的最大资源，用于定位驻留大头。
+
+    注意: residency/live_set 基于"使用生命周期"而非"驱动分配生命周期"，reducible 为假设
+    完美池化、且引擎尚未做别名复用的乐观上限，需结合具体资源核实。
     """
     return bridge.call(
         "estimate_vram",
@@ -298,6 +317,7 @@ def estimate_vram(
             "enable_name_heuristic": enable_name_heuristic,
             "enable_mesh_detection": enable_mesh_detection,
             "enable_live_set": enable_live_set,
+            "persistent_span_ratio": persistent_span_ratio,
             "collect_draw_names": collect_draw_names,
             "max_draw_names_per_buffer": max_draw_names_per_buffer,
             "large_resource_threshold_mb": large_resource_threshold_mb,
