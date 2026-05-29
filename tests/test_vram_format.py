@@ -286,6 +286,34 @@ def run():
     parts = res["persistent"]["bytes"] + res["transient"]["bytes"] + res["unreferenced_bytes"]
     failures += not _check("persistent+transient+unref == grand", parts, 2349)
 
+    # --- 按名强制持久覆盖: 窄使用窗口的跨帧缓存应被归回 persistent ---
+    nm_est = vram._VramEstimator(ctx=None, controller=None, enable_live_set=True,
+                                 enable_name_heuristic=True, persistent_span_ratio=0.5)
+    nm_est._usage_by_rid = {
+        "CACHE": {"roles": set(), "events": {10, 11}},   # span窄, 但名字含Cache
+        "RT": {"roles": set(), "events": {20, 21}},       # span窄, 普通瞬态
+    }
+    nm_rows = [
+        {"kind": "Texture", "category": "Texture/Regular", "resource_id": "CACHE", "bytes": 256, "name": "VT-Cache-128MiB"},
+        {"kind": "Texture", "category": "RT/Color", "resource_id": "RT", "bytes": 28, "name": "DOF.Recombine"},
+    ]
+    nm = nm_est._compute_residency(nm_rows)
+    failures += not _check("name-forced persistent bytes", nm["persistent"]["bytes"], 256)
+    failures += not _check("name-forced count", nm["persistent"]["name_forced_count"], 1)
+    failures += not _check("name-forced transient remains", nm["transient"]["bytes"], 28)
+
+    # 关闭名启发式时, 同样的缓存应回落到 transient (纯跨度判定)
+    nm_est2 = vram._VramEstimator(ctx=None, controller=None, enable_live_set=True,
+                                  enable_name_heuristic=False, persistent_span_ratio=0.5)
+    nm_est2._usage_by_rid = nm_est._usage_by_rid
+    nm2 = nm_est2._compute_residency(nm_rows)
+    failures += not _check("no-name-heuristic -> cache transient", nm2["persistent"]["bytes"], 0)
+
+    # 直接校验 is_persistent_by_name
+    failures += not _check("is_persistent VT-Cache", vram.is_persistent_by_name("VT-Cache-128MiB"), True)
+    failures += not _check("is_persistent History", vram.is_persistent_by_name("VSMHistory0"), True)
+    failures += not _check("is_persistent plain RT", vram.is_persistent_by_name("DOF.Recombine"), False)
+
     print("\n%d failure(s)" % failures)
     return failures
 

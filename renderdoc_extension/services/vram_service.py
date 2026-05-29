@@ -662,6 +662,13 @@ class _VramEstimator:
         - transient: a short-lived candidate whose memory could be reused by
           another non-overlapping transient resource.
 
+        Cross-frame caches/pools/history are resident for the whole session but
+        are only used in a narrow window of a single frame, so the span test
+        alone would misclassify them as transient and overstate the reducible
+        figure. When name heuristics are enabled, resources whose names match
+        known-persistent patterns are forced into the persistent bucket
+        regardless of span (reported as persistent.name_forced_*).
+
         Running the sweep-line peak over only the transient set gives the memory
         that set would need if perfectly pooled; the difference from its naive
         sum is the poolable headroom. Combined with the persistent floor and the
@@ -685,13 +692,29 @@ class _VramEstimator:
 
         persistent_rows = []
         transient_rows = []
+        name_forced_count = 0
+        name_forced_bytes = 0
         for row in rows:
             info = self._usage_by_rid.get(row.get("resource_id"))
             if not info or not info["events"]:
                 continue  # unreferenced; reported separately
             span = max(info["events"]) - min(info["events"])
-            if (float(span) / frame_span) >= self.persistent_span_ratio:
+            spans_frame = (float(span) / frame_span) >= self.persistent_span_ratio
+            # Cross-frame caches/pools/history are resident the whole session but
+            # are only *used* in a narrow window of this single frame, so the
+            # span test alone misclassifies them as transient and inflates the
+            # reducible estimate. A name override forces such known-persistent
+            # resources back into the persistent bucket.
+            forced = (
+                not spans_frame
+                and self.enable_name_heuristic
+                and is_persistent_by_name(row.get("name", ""))
+            )
+            if spans_frame or forced:
                 persistent_rows.append(row)
+                if forced:
+                    name_forced_count += 1
+                    name_forced_bytes += row.get("bytes", 0)
             else:
                 transient_rows.append(row)
 
@@ -722,7 +745,9 @@ class _VramEstimator:
                 "mib": round(mib(persistent_bytes), 4),
                 "count": len(persistent_rows),
                 "percent_of_grand_total": round((100.0 * persistent_bytes / grand) if grand > 0 else 0.0, 4),
-                "comment": "Resident throughout the frame; reduce via smaller format/resolution or pool-size settings.",
+                "name_forced_count": name_forced_count,
+                "name_forced_mib": round(mib(name_forced_bytes), 4),
+                "comment": "Resident throughout the frame; reduce via smaller format/resolution or pool-size settings. name_forced_* are narrow-usage resources reclassified as persistent by name (cross-frame caches/pools/history).",
                 "top_resources": [compact_row(row) for row in persistent_rows[:p_limit]],
             },
             "transient": {
@@ -1124,6 +1149,40 @@ def walk_draws(actions):
 
 def get_action_event_id(action):
     return to_int(safe_get(action, ["eventId", "eventID"], 0), 0)
+
+
+# Name fragments that strongly indicate a cross-frame-persistent resource
+# (streaming/virtual-texture caches, shadow/VSM physical pools, temporal history,
+# runtime-resident arrays). Such resources are resident the whole session even
+# when used only briefly within a single captured frame.
+_PERSISTENT_NAME_HINTS = [
+    "cache",
+    "pool",
+    "history",
+    "streaming",
+    "runtimeonly",
+    "runtime only",
+    "persistent",
+    "vt-",
+    "vt_",
+    "virtualtexture",
+    "virtual texture",
+    "pagetable",
+    "page table",
+    "pagepool",
+    "page pool",
+    "physicalpage",
+    "physical page",
+    "vsm",
+    "virtualshadow",
+    "virtual shadow",
+    "nanite",
+]
+
+
+def is_persistent_by_name(name):
+    """Heuristic: does the resource name mark it as cross-frame persistent?"""
+    return contains_any(name or "", _PERSISTENT_NAME_HINTS)
 
 
 def geometry_category_from_roles(roles):

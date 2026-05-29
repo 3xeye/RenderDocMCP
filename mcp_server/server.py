@@ -286,7 +286,10 @@ def estimate_vram(
         enable_live_set: 计算同时存活峰值(live_set)、驻留拆解(residency)与未引用资源
             (unreferenced)；关闭可跳过这部分使用数据扫描。
         persistent_span_ratio: 驻留拆解阈值[0,1]。资源使用区间覆盖帧事件跨度的比例 >= 该
-            值则判为"真持久(只能缩)"，否则为"瞬态候选(可池化)"。默认 0.5。
+            值则判为"真持久(只能缩)"，否则为"瞬态候选(可池化)"。默认 0.5。另外开启
+            enable_name_heuristic 时，名字命中缓存/池/历史/VT/VSM/Nanite 等模式的跨帧
+            常驻资源会被强制归为持久(见 residency.persistent.name_forced_*)，避免被误判
+            为可池化而高估可省量。
         collect_draw_names: 在 Mesh Buffer 备注中附带示例 drawcall 名。
         max_draw_names_per_buffer: 每个 Mesh Buffer 记录的 draw 名上限。
         large_resource_threshold_mb: 大资源提示阈值(MiB)。
